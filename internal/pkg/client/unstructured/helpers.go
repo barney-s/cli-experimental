@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors.
+Copyright 2019 The Kubernetes Authors.
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -21,37 +21,6 @@ import (
 
 func jsonPath(fields []string) string {
 	return "." + strings.Join(fields, ".")
-}
-
-// NestedInt returns the int value of a nested field.
-// Returns false if value is not found and an error if not an int
-func NestedInt(obj map[string]interface{}, fields ...string) (int, bool, error) {
-	var i int
-	var i32 int32
-	var i64 int64
-	var ok bool
-
-	val, found, err := api_unstructured.NestedFieldNoCopy(obj, fields...)
-	if !found || err != nil {
-		return 0, found, err
-	}
-	i, ok = val.(int)
-	if !ok {
-		i32, ok = val.(int32)
-		if ok {
-			i = int(i32)
-		}
-	}
-	if !ok {
-		i64, ok = val.(int64)
-		if ok {
-			i = int(i64)
-		}
-	}
-	if !ok {
-		return 0, true, fmt.Errorf("%v accessor error: %v is of the type %T, expected int", jsonPath(fields), val, val)
-	}
-	return i, true, nil
 }
 
 // NestedMapSlice returns the value of a nested field.
@@ -80,16 +49,49 @@ func NestedMapSlice(obj map[string]interface{}, fields ...string) ([]map[string]
 }
 
 // GetStringField - return field as string defaulting to value if not found
-func GetStringField(obj map[string]interface{}, field, defaultValue string) string {
-	value := defaultValue
-	fieldV, ok := obj[field]
-	if ok {
-		stringV, ok := fieldV.(string)
-		if ok {
-			value = stringV
-		}
+func GetStringField(obj map[string]interface{}, fieldPath string, defaultValue string) string {
+	var rv = defaultValue
+
+	fields := strings.Split(fieldPath, ".")
+	if fields[0] == "" {
+		fields = fields[1:]
 	}
-	return value
+
+	val, found, err := api_unstructured.NestedFieldNoCopy(obj, fields...)
+	if !found || err != nil {
+		return rv
+	}
+
+	switch val.(type) {
+	case string:
+		rv = val.(string)
+	}
+	return rv
+}
+
+// GetIntField - return field as string defaulting to value if not found
+func GetIntField(obj map[string]interface{}, fieldPath string, defaultValue int) int {
+	var rv = defaultValue
+
+	fields := strings.Split(fieldPath, ".")
+	if fields[0] == "" {
+		fields = fields[1:]
+	}
+
+	val, found, err := api_unstructured.NestedFieldNoCopy(obj, fields...)
+	if !found || err != nil {
+		return rv
+	}
+
+	switch val.(type) {
+	case int:
+		rv = val.(int)
+	case int32:
+		rv = int(val.(int32))
+	case int64:
+		rv = int(val.(int64))
+	}
+	return rv
 }
 
 // GetConditions - return conditions array as []map[string]interface{}

@@ -19,11 +19,23 @@ import (
 	"io"
 
 	"gopkg.in/src-d/go-git.v4/plumbing/object"
+	//metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/errors"
 	"sigs.k8s.io/cli-experimental/internal/pkg/client"
 	"sigs.k8s.io/cli-experimental/internal/pkg/clik8s"
+)
+
+// Condition types
+const (
+	// Level condition
+	ConditionReady   ConditionType = "Ready"
+	ConditionSettled ConditionType = "Settled"
+
+	// Terminal condition
+	ConditionFailed    ConditionType = "Failed"
+	ConditionCompleted ConditionType = "Completed"
 )
 
 // Status returns the status for rollouts
@@ -39,22 +51,61 @@ type Status struct {
 	Commit *object.Commit
 }
 
+// ConditionType - condition types
+type ConditionType string
+
+// Condition - generic condition
+type Condition struct {
+	Type   ConditionType
+	Status string // metav1.ConditionStatus
+	Reason string
+}
+
 // ResourceStatus - resource status
 type ResourceStatus struct {
-	Resource *unstructured.Unstructured
-	Status   string
-	Error    error
+	Resource   *unstructured.Unstructured
+	Conditions []Condition
+	Error      error
 }
 
 // Result contains the Status Result
 type Result struct {
-	Ready     bool
 	Resources []ResourceStatus
+}
+
+// NewFalseCondition condition
+func NewFalseCondition(ctype ConditionType) Condition {
+	return Condition{Type: ctype, Status: "False", Reason: ""}
+}
+
+// NewCondition condition
+func NewCondition(ctype ConditionType, reason string) *Condition {
+	return &Condition{Type: ctype, Status: "True", Reason: reason}
+}
+
+// Get - simple wrapper to avoid *
+func (c *Condition) Get() Condition {
+	return *c
+}
+
+// False - set condition to false
+func (c *Condition) False() *Condition {
+	c.Status = "False"
+	return c
+}
+
+// GetCondition - condition
+func GetCondition(cs []Condition, ct ConditionType) *Condition {
+	for i := range cs {
+		if cs[i].Type == ct {
+			return &cs[i]
+		}
+	}
+	return nil
 }
 
 // Do executes the status
 func (a *Status) Do() (Result, error) {
-	ready := true
 	var errs []error
 	var rs = []ResourceStatus{}
 
@@ -64,42 +115,40 @@ func (a *Status) Do() (Result, error) {
 		err := a.DynamicClient.Get(ctx,
 			types.NamespacedName{Namespace: u.GetNamespace(), Name: u.GetName()}, u)
 		if err != nil {
-			rs = append(rs, ResourceStatus{Resource: u, Status: "GET_ERROR", Error: err})
+			rs = append(rs, ResourceStatus{Resource: u, Error: err})
 			errs = append(errs, err)
 			continue
 		}
 
 		// Ready indicator is a simple ANDing of all the individual resource readiness
-		uReady, err := IsReady(u)
+		conditions, err := IsReady(u)
 		if err != nil {
-			rs = append(rs, ResourceStatus{Resource: u, Status: "ERROR", Error: err})
+			rs = append(rs, ResourceStatus{Resource: u, Error: err})
 			errs = append(errs, err)
 			continue
 		}
-		status := "Ready"
-		if !ready {
-			status = "InProgress"
-		}
-		rs = append(rs, ResourceStatus{Resource: u, Status: status, Error: nil})
-		ready = ready && uReady
+		rs = append(rs, ResourceStatus{Resource: u, Conditions: conditions, Error: nil})
 	}
 
 	if len(errs) != 0 {
-		return Result{Ready: ready, Resources: rs}, errors.NewAggregate(errs)
+		return Result{Resources: rs}, errors.NewAggregate(errs)
 	}
-	return Result{Ready: ready, Resources: rs}, nil
+	return Result{Resources: rs}, nil
 }
 
 // IsReady - return true if object is ready
-func IsReady(u *unstructured.Unstructured) (bool, error) {
+func IsReady(u *unstructured.Unstructured) ([]Condition, error) {
+	var conditions []Condition
+	var err error
+
 	fn := GetLegacyReadyFn(u)
 	if fn == nil {
 		fn = GetGenericReadyFn(u)
 	}
 
 	if fn != nil {
-		return fn(u)
+		conditions, err = fn(u)
 	}
 
-	return true, nil
+	return conditions, err
 }

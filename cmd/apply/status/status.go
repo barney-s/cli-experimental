@@ -15,7 +15,6 @@ package status
 
 import (
 	"fmt"
-	//"os"
 
 	"github.com/spf13/cobra"
 	"sigs.k8s.io/cli-experimental/internal/pkg/clik8s"
@@ -37,7 +36,7 @@ func GetApplyStatusCommand(a util.Args) *cobra.Command {
 			result, err := wirestatus.DoStatus(clik8s.ResourceConfigPath(args[i]), cmd.OutOrStdout(), a)
 			for i := range result.Resources {
 				u := result.Resources[i].Resource
-				fmt.Fprintf(cmd.OutOrStdout(), "%s/%s   %s", u.GetKind(), u.GetName(), result.Resources[i].Status)
+				fmt.Fprintf(cmd.OutOrStdout(), "%s/%s   %s", u.GetKind(), u.GetName(), result.Resources[i].Display)
 				if result.Resources[i].Error != nil {
 					fmt.Fprintf(cmd.OutOrStdout(), "(err: %s)", result.Resources[i].Error)
 				}

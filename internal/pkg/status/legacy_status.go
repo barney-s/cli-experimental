@@ -19,32 +19,32 @@ import (
 	clientu "sigs.k8s.io/cli-experimental/internal/pkg/client/unstructured"
 )
 
-// IsReadyFn - status getter
-type IsReadyFn func(*unstructured.Unstructured) (bool, error)
+// GetConditionsFn - status getter
+type GetConditionsFn func(*unstructured.Unstructured) ([]Condition, error)
 
-var legacyTypes = map[string]map[string]IsReadyFn{
-	"": map[string]IsReadyFn{
-		"Service":               alwaysReady,
-		"Pod":                   podReady,
-		"PersistentVolumeClaim": pvcReady,
+var legacyTypes = map[string]map[string]GetConditionsFn{
+	"": map[string]GetConditionsFn{
+		"Service":               serviceConditions,
+		"Pod":                   podConditions,
+		"PersistentVolumeClaim": pvcConditions,
 	},
-	"apps": map[string]IsReadyFn{
-		"StatefulSet": stsReady,
-		"DaemonSet":   daemonsetReady,
-		"Deployment":  deploymentReady,
-		"ReplicaSet":  replicasetReady,
+	"apps": map[string]GetConditionsFn{
+		"StatefulSet": stsConditions,
+		"DaemonSet":   daemonsetConditions,
+		"Deployment":  deploymentConditions,
+		"ReplicaSet":  replicasetConditions,
 	},
-	"policy": map[string]IsReadyFn{
-		"PodDisruptionBudget": pdbReady,
+	"policy": map[string]GetConditionsFn{
+		"PodDisruptionBudget": pdbConditions,
 	},
-	"batch": map[string]IsReadyFn{
-		"CronJob": cronjobReady,
-		"Job":     jobReady,
+	"batch": map[string]GetConditionsFn{
+		"CronJob": alwaysReady,
+		"Job":     jobConditions,
 	},
 }
 
 // GetLegacyReadyFn - True if we handle it as a known type
-func GetLegacyReadyFn(u *unstructured.Unstructured) IsReadyFn {
+func GetLegacyReadyFn(u *unstructured.Unstructured) GetConditionsFn {
 	gvk := u.GroupVersionKind()
 	g := gvk.Group
 	k := gvk.Kind
@@ -56,183 +56,423 @@ func GetLegacyReadyFn(u *unstructured.Unstructured) IsReadyFn {
 	return nil
 }
 
-func alwaysReady(u *unstructured.Unstructured) (bool, error) { return true, nil }
-
-func compareIntFields(u *unstructured.Unstructured, field1, field2 []string, checkFuncs ...func(int, int) bool) (bool, error) {
-	v1, ok, err := clientu.NestedInt(u.UnstructuredContent(), field1...)
-	if err != nil {
-		return true, err
-	}
-	if !ok {
-		return false, fmt.Errorf("%v not found", field1)
-	}
-
-	v2, ok, err := clientu.NestedInt(u.UnstructuredContent(), field2...)
-	if err != nil {
-		return true, err
-	}
-	if !ok {
-		return false, fmt.Errorf("%v not found", field2)
-	}
-
-	rv := true
-
-	for _, fn := range checkFuncs {
-		rv = rv && fn(v1, v2)
-	}
-
-	return rv, nil
+func alwaysReady(u *unstructured.Unstructured) ([]Condition, error) {
+	return []Condition{Condition{Type: ConditionReady, Reason: "always", Status: "True"}}, nil
 }
 
-func equalInt(v1, v2 int) bool { return v1 == v2 }
-func geInt(v1, v2 int) bool    { return v1 >= v2 }
-
 // Statefulset
-func stsReady(u *unstructured.Unstructured) (bool, error) {
-	c1, err := compareIntFields(u, []string{"status", "readyReplicas"}, []string{"spec", "replicas"}, equalInt)
-	if err != nil {
-		return c1, err
+func stsConditions(u *unstructured.Unstructured) ([]Condition, error) {
+	obj := u.UnstructuredContent()
+	readyCondition := NewFalseCondition(ConditionReady)
+	updateStrategy := clientu.GetStringField(obj, ".spec.updateStrategy.type", "")
+
+	// updateStrategy==ondelete is a user managed statefulset.
+	if updateStrategy == "ondelete" {
+		readyCondition.Status = "True"
+		readyCondition.Reason = "ondelete strategy"
+		return []Condition{readyCondition}, nil
 	}
-	c2, err := compareIntFields(u, []string{"status", "currentReplicas"}, []string{"spec", "replicas"}, equalInt)
-	if err != nil {
-		return c2, err
+
+	// ensure that the meta generation is observed
+	observedGeneration := clientu.GetIntField(obj, ".status.observedGeneration", -1)
+	metaGeneration := clientu.GetIntField(obj, ".metadata.generation", -1)
+	if observedGeneration != metaGeneration {
+		readyCondition.Reason = "Controller has not observed the latest change. Status generation does not match with metadata"
+		return []Condition{readyCondition}, nil
 	}
-	return c1 && c2, nil
+
+	// Replicas
+	specReplicas := clientu.GetIntField(obj, ".spec.replicas", 1)
+	readyReplicas := clientu.GetIntField(obj, ".status.readyReplicas", 0)
+	currentReplicas := clientu.GetIntField(obj, ".status.currentReplicas", 0)
+	updatedReplicas := clientu.GetIntField(obj, ".status.updatedReplicas", 0)
+	statusReplicas := clientu.GetIntField(obj, ".status.replicas", 0)
+	partition := clientu.GetIntField(obj, ".spec.updateStrategy.rollingUpdate.partition", -1)
+
+	if specReplicas > statusReplicas {
+		readyCondition.Reason = fmt.Sprintf("Waiting for requested replicas. Replicas: %d/%d", statusReplicas, specReplicas)
+		return []Condition{readyCondition}, nil
+	}
+
+	if specReplicas > readyReplicas {
+		readyCondition.Reason = fmt.Sprintf("Waiting for replicas to become Ready. Ready: %d/%d", readyReplicas, specReplicas)
+		return []Condition{readyCondition}, nil
+	}
+
+	if partition != -1 {
+		if updatedReplicas < (specReplicas - partition) {
+			readyCondition.Reason = fmt.Sprintf("Waiting for partition rollout to complete. updated: %d/%d", updatedReplicas, specReplicas-partition)
+		} else {
+			// Partition case All ok
+			readyCondition.Status = "True"
+			readyCondition.Reason = fmt.Sprintf("Partition rollout complete. updated: %d", updatedReplicas)
+		}
+		return []Condition{readyCondition}, nil
+
+	}
+
+	if specReplicas > currentReplicas {
+		readyCondition.Reason = fmt.Sprintf("Waiting for replicas to become current. current: %d/%d", currentReplicas, specReplicas)
+		return []Condition{readyCondition}, nil
+	}
+
+	// Revision
+	currentRevision := clientu.GetStringField(obj, ".status.currentRevision", "")
+	updatedRevision := clientu.GetStringField(obj, ".status.updatedRevision", "")
+	if currentRevision != updatedRevision {
+		readyCondition.Reason = "Waiting for updated revision to match currentd"
+		return []Condition{readyCondition}, nil
+	}
+
+	// All ok
+	readyCondition.Status = "True"
+	readyCondition.Reason = fmt.Sprintf("All replicas scheduled as expected. Replicas: %d", statusReplicas)
+	return []Condition{readyCondition}, nil
 }
 
 // Deployment
-func deploymentReady(u *unstructured.Unstructured) (bool, error) {
-	progress := true
-	available := true
-	conditions := clientu.GetConditions(u.UnstructuredContent())
+func deploymentConditions(u *unstructured.Unstructured) ([]Condition, error) {
+	obj := u.UnstructuredContent()
+	readyCondition := NewFalseCondition(ConditionReady)
 
-	if len(conditions) == 0 {
-		return false, fmt.Errorf("no conditions in object")
+	progress := false
+	available := false
+
+	// ensure that the meta generation is observed
+	observedGeneration := clientu.GetIntField(obj, ".status.observedGeneration", -1)
+	metaGeneration := clientu.GetIntField(obj, ".metadata.generation", -1)
+	if observedGeneration != metaGeneration {
+		readyCondition.Reason = "Controller has not observed the latest change. Status generation does not match with metadata"
+		return []Condition{readyCondition}, nil
 	}
 
+	conditions := clientu.GetConditions(obj)
+
 	for _, c := range conditions {
-		switch clientu.GetStringField(c, "type", "") {
+		status := clientu.GetStringField(c, ".status", "")
+		reason := clientu.GetStringField(c, ".reason", "")
+		switch clientu.GetStringField(c, ".type", "") {
 		case "Progressing": //appsv1.DeploymentProgressing:
 			// https://github.com/kubernetes/kubernetes/blob/a3ccea9d8743f2ff82e41b6c2af6dc2c41dc7b10/pkg/controller/deployment/progress.go#L52
-			status := clientu.GetStringField(c, "status", "")
-			reason := clientu.GetStringField(c, "reason", "")
-			if status != "True" || reason != "NewReplicaSetAvailable" {
-				progress = false
+			if reason == "ProgressDeadlineExceeded" {
+				readyCondition.Reason = "Progress Deadline exceeded"
+				return []Condition{readyCondition}, nil
+			}
+			if status == "True" && reason == "NewReplicaSetAvailable" {
+				progress = true
 			}
 		case "Available": //appsv1.DeploymentAvailable:
-			status := clientu.GetStringField(c, "status", "")
-			if status == "False" {
-				available = false
+			if status == "True" {
+				available = true
 			}
 		}
 	}
 
-	return progress && available, nil
+	// replicas
+	specReplicas := clientu.GetIntField(obj, ".spec.replicas", 1)
+	statusReplicas := clientu.GetIntField(obj, ".status.replicas", 0)
+	updatedReplicas := clientu.GetIntField(obj, ".status.updatedReplicas", 0)
+	readyReplicas := clientu.GetIntField(obj, ".status.readyReplicas", 0)
+	availableReplicas := clientu.GetIntField(obj, ".status.availableReplicas", 0)
+
+	// TODO spec.replicas zero case ??
+
+	if specReplicas > updatedReplicas {
+		readyCondition.Reason = fmt.Sprintf("Waiting for all replicas to be updated. Updated: %d/%d", updatedReplicas, specReplicas)
+		return []Condition{readyCondition}, nil
+	}
+
+	if statusReplicas > updatedReplicas {
+		readyCondition.Reason = fmt.Sprintf("Waiting for old replicas to finish termination. Pending termination: %d", statusReplicas-updatedReplicas)
+		return []Condition{readyCondition}, nil
+	}
+
+	if updatedReplicas > availableReplicas {
+		readyCondition.Reason = fmt.Sprintf("Waiting for all replicas to be available. Available: %d/%d", availableReplicas, updatedReplicas)
+		return []Condition{readyCondition}, nil
+	}
+
+	if specReplicas > readyReplicas {
+		readyCondition.Reason = fmt.Sprintf("Waiting for all replicas to be ready. Ready: %d/%d", readyReplicas, specReplicas)
+		return []Condition{readyCondition}, nil
+	}
+
+	if specReplicas > statusReplicas {
+		readyCondition.Reason = fmt.Sprintf("Waiting for all .status.replicas to be catchup. replicas: %d/%d", statusReplicas, specReplicas)
+		return []Condition{readyCondition}, nil
+	}
+	// check conditions
+	if !progress {
+		readyCondition.Reason = "New ReplicaSet is not available"
+		return []Condition{readyCondition}, nil
+	}
+	if !available {
+		readyCondition.Reason = "Deployment is not Available"
+		return []Condition{readyCondition}, nil
+	}
+	// All ok
+	readyCondition.Status = "True"
+	readyCondition.Reason = fmt.Sprintf("Deployment is available. Replicas: %d", statusReplicas)
+	return []Condition{readyCondition}, nil
 }
 
 // Replicaset
-func replicasetReady(u *unstructured.Unstructured) (bool, error) {
-	failure := false
-	conditions := clientu.GetConditions(u.UnstructuredContent())
+func replicasetConditions(u *unstructured.Unstructured) ([]Condition, error) {
+	obj := u.UnstructuredContent()
+	readyCondition := NewFalseCondition(ConditionReady)
 
+	// ensure that the meta generation is observed
+	observedGeneration := clientu.GetIntField(obj, ".status.observedGeneration", -1)
+	metaGeneration := clientu.GetIntField(obj, ".metadata.generation", -1)
+	if observedGeneration != metaGeneration {
+		readyCondition.Reason = "Controller has not observed the latest change. Status generation does not match with metadata"
+		return []Condition{readyCondition}, nil
+	}
+
+	// Conditions
+	conditions := clientu.GetConditions(u.UnstructuredContent())
 	for _, c := range conditions {
-		switch clientu.GetStringField(c, "type", "") {
+		switch clientu.GetStringField(c, ".type", "") {
 		// https://github.com/kubernetes/kubernetes/blob/a3ccea9d8743f2ff82e41b6c2af6dc2c41dc7b10/pkg/controller/replicaset/replica_set_utils.go
 		case "ReplicaFailure": //appsv1.ReplicaSetReplicaFailure
-			status := clientu.GetStringField(c, "status", "")
+			status := clientu.GetStringField(c, ".status", "")
 			if status == "True" {
-				failure = true
-				break
+				readyCondition.Reason = "Replica Failure condition. Check Pods"
+				return []Condition{readyCondition}, nil
 			}
 		}
 	}
 
-	c1, err := compareIntFields(u, []string{"status", "replicas"}, []string{"status", "readyReplicas"}, equalInt)
-	if err != nil {
-		return c1, err
-	}
-	c2, err := compareIntFields(u, []string{"status", "replicas"}, []string{"status", "availableReplicas"}, equalInt)
-	if err != nil {
-		return c2, err
+	// Replicas
+	specReplicas := clientu.GetIntField(obj, ".spec.replicas", 1)
+	statusReplicas := clientu.GetIntField(obj, ".status.replicas", 0)
+	readyReplicas := clientu.GetIntField(obj, ".status.readyReplicas", 0)
+	availableReplicas := clientu.GetIntField(obj, ".status.availableReplicas", 0)
+	labelledReplicas := clientu.GetIntField(obj, ".status.labelledReplicas", 0)
+
+	if specReplicas == 0 && labelledReplicas == 0 && availableReplicas == 0 && readyReplicas == 0 {
+		readyCondition.Reason = "Replica is 0"
+		return []Condition{readyCondition}, nil
 	}
 
-	return !failure && c1 && c2, nil
+	if specReplicas > labelledReplicas {
+
+		readyCondition.Reason = fmt.Sprintf("Waiting for all replicas to be fully-labeled. Labelled: %d/%d", labelledReplicas, specReplicas)
+		return []Condition{readyCondition}, nil
+	}
+
+	if specReplicas > availableReplicas {
+		readyCondition.Reason = fmt.Sprintf("Waiting for all replicas to be available. Available: %d/%d", availableReplicas, specReplicas)
+		return []Condition{readyCondition}, nil
+	}
+
+	if specReplicas > readyReplicas {
+		readyCondition.Reason = fmt.Sprintf("Waiting for all replicas to be ready. Ready: %d/%d", readyReplicas, specReplicas)
+		return []Condition{readyCondition}, nil
+	}
+
+	// All ok
+	readyCondition.Status = "True"
+	readyCondition.Reason = fmt.Sprintf("ReplicaSet is available. Replicas: %d", statusReplicas)
+	return []Condition{readyCondition}, nil
 }
 
 // Daemonset
-func daemonsetReady(u *unstructured.Unstructured) (bool, error) {
-	c1, err := compareIntFields(u, []string{"status", "desiredNumberScheduled"}, []string{"status", "numberAvailable"}, equalInt)
-	if err != nil {
-		return c1, err
-	}
-	c2, err := compareIntFields(u, []string{"status", "desiredNumberScheduled"}, []string{"status", "numberReady"}, equalInt)
-	if err != nil {
-		return c2, err
+func daemonsetConditions(u *unstructured.Unstructured) ([]Condition, error) {
+	obj := u.UnstructuredContent()
+	readyCondition := NewFalseCondition(ConditionReady)
+
+	// ensure that the meta generation is observed
+	observedGeneration := clientu.GetIntField(obj, ".status.observedGeneration", -1)
+	metaGeneration := clientu.GetIntField(obj, ".metadata.generation", -1)
+	if observedGeneration != metaGeneration {
+		readyCondition.Reason = "Controller has not observed the latest change. Status generation does not match with metadata"
+		return []Condition{readyCondition}, nil
 	}
 
-	return c1 && c2, nil
+	// replicas
+	desiredNumberScheduled := clientu.GetIntField(obj, ".status.desiredNumberScheduled", -1)
+	currentNumberScheduled := clientu.GetIntField(obj, ".status.currentNumberScheduled", 0)
+	updatedNumberScheduled := clientu.GetIntField(obj, ".status.updatedNumberScheduled", 0)
+	numberAvailable := clientu.GetIntField(obj, ".status.numberAvailable", 0)
+	numberReady := clientu.GetIntField(obj, ".status.numberReady", 0)
+
+	if desiredNumberScheduled == -1 {
+		readyCondition.Reason = "Missing .status.desiredNumberScheduled"
+		return []Condition{readyCondition}, nil
+	}
+
+	if desiredNumberScheduled > currentNumberScheduled {
+		readyCondition.Reason = fmt.Sprintf("Waiting for desired replicas to be scheduled. Current: %d/%d", currentNumberScheduled, desiredNumberScheduled)
+		return []Condition{readyCondition}, nil
+	}
+
+	if desiredNumberScheduled > updatedNumberScheduled {
+		readyCondition.Reason = fmt.Sprintf("Waiting for updated replicas to be scheduled. Updated: %d/%d", updatedNumberScheduled, desiredNumberScheduled)
+		return []Condition{readyCondition}, nil
+	}
+
+	if desiredNumberScheduled > numberAvailable {
+		readyCondition.Reason = fmt.Sprintf("Waiting for replicas to be available. Available: %d/%d", numberAvailable, desiredNumberScheduled)
+		return []Condition{readyCondition}, nil
+	}
+
+	if desiredNumberScheduled > numberReady {
+		readyCondition.Reason = fmt.Sprintf("Waiting for replicas to be ready. Ready: %d/%d", numberReady, desiredNumberScheduled)
+		return []Condition{readyCondition}, nil
+	}
+
+	// All ok
+	readyCondition.Status = "True"
+	readyCondition.Reason = fmt.Sprintf("All replicas scheduled as expected. Replicas: %d", desiredNumberScheduled)
+	return []Condition{readyCondition}, nil
 }
 
 // PVC
-func pvcReady(u *unstructured.Unstructured) (bool, error) {
-	val, found, err := unstructured.NestedString(u.UnstructuredContent(), "status", "phase")
-	if err != nil {
-		return false, err
+func pvcConditions(u *unstructured.Unstructured) ([]Condition, error) {
+	obj := u.UnstructuredContent()
+	readyCondition := NewFalseCondition(ConditionReady)
+	phase := clientu.GetStringField(obj, ".status.phase", "unknown")
+	if phase != "Bound" { // corev1.ClaimBound
+		readyCondition.Reason = fmt.Sprintf("PVC is not Bound. phase: %s", phase)
+		return []Condition{readyCondition}, nil
 	}
-	if !found {
-		return false, fmt.Errorf(".status.phase not found")
-	}
-	return val == "Bound", nil // corev1.ClaimBound
+	// All ok
+	readyCondition.Status = "True"
+	readyCondition.Reason = "PVC is Bound"
+	return []Condition{readyCondition}, nil
 }
 
 // Pod
-func podReady(u *unstructured.Unstructured) (bool, error) {
-	conditions := clientu.GetConditions(u.UnstructuredContent())
+func podConditions(u *unstructured.Unstructured) ([]Condition, error) {
+	rv := []Condition{}
+	readyCondition := NewFalseCondition(ConditionReady)
+	obj := u.UnstructuredContent()
+
+	phase := clientu.GetStringField(obj, ".status.phase", "unknown")
+	conditions := clientu.GetConditions(obj)
 
 	for _, c := range conditions {
-		if clientu.GetStringField(c, "type", "") == "Ready" && (clientu.GetStringField(c, "status", "") == "True" || clientu.GetStringField(c, "reason", "") == "PodCompleted") {
-			return true, nil
+		switch clientu.GetStringField(c, ".type", "") {
+		case "Ready":
+			readyCondition.Reason = clientu.GetStringField(c, "reason", "")
+			if clientu.GetStringField(c, "status", "") == "True" {
+				readyCondition.Status = "True"
+			} else {
+				readyCondition.Status = "False"
+				if clientu.GetStringField(c, "reason", "") == "PodCompleted" {
+					readyCondition.Status = "True"
+					if phase == "Succeeded" {
+						rv = append(rv, NewCondition(ConditionCompleted, "Pod Succeeded").Get())
+					} else {
+						rv = append(rv, NewCondition(ConditionFailed, fmt.Sprintf("Pod phase: %s", phase)).Get())
+					}
+				}
+			}
 		}
 	}
-	return false, nil
+
+	if readyCondition.Reason == "" {
+		readyCondition.Reason = "Phase: " + phase
+	} else {
+		readyCondition.Reason = "Phase: " + phase + ", " + readyCondition.Reason
+	}
+	rv = append(rv, readyCondition)
+	return rv, nil
 }
 
 // PodDisruptionBudget
-func pdbReady(u *unstructured.Unstructured) (bool, error) {
-	return compareIntFields(u, []string{"status", "currentHealthy"}, []string{"status", "desiredHealthy"}, geInt)
-}
-
-// Cronjob
-func cronjobReady(u *unstructured.Unstructured) (bool, error) {
+func pdbConditions(u *unstructured.Unstructured) ([]Condition, error) {
 	obj := u.UnstructuredContent()
-	_, ok := obj["status"]
-	if !ok {
-		return false, nil
+	readyCondition := NewFalseCondition(ConditionReady)
+
+	// replicas
+	currentHealthy := clientu.GetIntField(obj, ".status.currentHealthy", 0)
+	desiredHealthy := clientu.GetIntField(obj, ".status.desiredHealthy", -1)
+	if desiredHealthy == -1 {
+		readyCondition.Reason = "Missing .status.desiredHealthy"
+		return []Condition{readyCondition}, nil
 	}
-	return true, nil
+	if desiredHealthy > currentHealthy {
+		readyCondition.Reason = fmt.Sprintf("Budget not met. healthy replicas: %d/%d", currentHealthy, desiredHealthy)
+		return []Condition{readyCondition}, nil
+	}
+
+	// All ok
+	readyCondition.Status = "True"
+	readyCondition.Reason = fmt.Sprintf("Budget is met. Replicas: %d/%d", currentHealthy, desiredHealthy)
+	return []Condition{readyCondition}, nil
 }
 
 // Job
-func jobReady(u *unstructured.Unstructured) (bool, error) {
-	complete := false
-	failed := false
+func jobConditions(u *unstructured.Unstructured) ([]Condition, error) {
+	obj := u.UnstructuredContent()
 
-	conditions := clientu.GetConditions(u.UnstructuredContent())
+	parallelism := clientu.GetIntField(obj, ".spec.parallelism", 1)
+	completions := clientu.GetIntField(obj, ".spec.completions", parallelism)
+	succeeded := clientu.GetIntField(obj, ".status.succeeded", 0)
+	active := clientu.GetIntField(obj, ".status.active", 0)
+	failed := clientu.GetIntField(obj, ".status.failed", 0)
+	conditions := clientu.GetConditions(obj)
+	starttime := clientu.GetStringField(obj, ".status.startTime", "")
 
+	// Conditions
 	// https://github.com/kubernetes/kubernetes/blob/master/pkg/controller/job/utils.go#L24
 	for _, c := range conditions {
-		status := clientu.GetStringField(c, "status", "")
-		switch clientu.GetStringField(c, "type", "") {
+		status := clientu.GetStringField(c, ".status", "")
+		switch clientu.GetStringField(c, ".type", "") {
 		case "Complete":
 			if status == "True" {
-				complete = true
+				message := fmt.Sprintf("Job Completed. succeded: %d/%d", succeeded, completions)
+				return []Condition{
+					NewCondition(ConditionReady, message).Get(),
+					NewCondition(ConditionCompleted, message).Get(),
+				}, nil
 			}
 		case "Failed":
 			if status == "True" {
-				failed = true
+				message := fmt.Sprintf("Job Failed. failed: %d/%d", failed, completions)
+				return []Condition{
+					NewCondition(ConditionReady, message).Get(),
+					NewCondition(ConditionFailed, message).Get(),
+				}, nil
 			}
 		}
 	}
 
-	return complete || failed, nil
+	// replicas
+	if starttime == "" {
+		message := "Job not started"
+		return []Condition{
+			NewCondition(ConditionReady, message).False().Get(),
+		}, nil
+	}
+	message := fmt.Sprintf("Job in progress. success:%d, active: %d, failed: %d", succeeded, active, failed)
+	return []Condition{
+		NewCondition(ConditionReady, message).Get(),
+	}, nil
+}
+
+// Service
+func serviceConditions(u *unstructured.Unstructured) ([]Condition, error) {
+	obj := u.UnstructuredContent()
+
+	specType := clientu.GetStringField(obj, ".spec.type", "ClusterIP")
+	specClusterIP := clientu.GetStringField(obj, ".spec.clusterIP", "")
+	//statusLBIngress := clientu.GetStringField(obj, ".status.loadBalancer.ingress", "")
+
+	message := fmt.Sprintf("Always Ready. Service type: %s", specType)
+	if specType == "LoadBalancer" {
+		if specClusterIP == "" {
+			message = "ClusterIP not set. Service type: LoadBalancer"
+			return []Condition{
+				NewCondition(ConditionReady, message).False().Get(),
+			}, nil
+		}
+		message = fmt.Sprintf("ClusterIP: %s", specClusterIP)
+	}
+
+	return []Condition{
+		NewCondition(ConditionReady, message).Get(),
+	}, nil
 }
